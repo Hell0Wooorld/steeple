@@ -1,0 +1,12 @@
+{
+  "_comment": "각 교단 총회의 공식 이단 결의를 출처와 함께 싣는 구조입니다. 현재는 모든 교단이 '자료 준비 중'입니다. 필드 설명은 README를 참고하세요.",
+  "denominations": [
+    { "denominationId": "tonghap",  "status": "preparing", "entries": [] },
+    { "denominationId": "hapdong",  "status": "preparing", "entries": [] },
+    { "denominationId": "gosin",    "status": "preparing", "entries": [] },
+    { "denominationId": "kmc",      "status": "preparing", "entries": [] },
+    { "denominationId": "sungkyul", "status": "preparing", "entries": [] },
+    { "denominationId": "baptist",  "status": "preparing", "entries": [] },
+    { "denominationId": "kj",       "status": "preparing", "entries": [] }
+  ]
+}
