@@ -1,21 +1,45 @@
 import 'package:flutter/material.dart';
 
-import '../data/study_store.dart';
+import '../data/study_repository.dart';
 import '../format.dart';
-import '../logic/rewards.dart';
 import 'session_screen.dart';
 
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key, required this.store, required this.policy});
+  const HomeScreen({super.key, required this.repo});
 
-  final StudyStore store;
-  final RewardPolicy policy;
+  final StudyRepository repo;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final store = repo;
+    final policy = repo.policy;
+    final account = repo.accountLabel;
     return Scaffold(
-      appBar: AppBar(title: const Text('순공')),
+      appBar: AppBar(
+        title: const Text('순공'),
+        actions: [
+          if (account == null)
+            const Padding(
+              padding: EdgeInsets.only(right: 12),
+              child: Tooltip(
+                message: 'Firebase 설정 전이라 기록이 이 기기에만 저장돼요',
+                child: Chip(label: Text('기기 저장 모드')),
+              ),
+            )
+          else
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.account_circle_outlined),
+              onSelected: (v) {
+                if (v == 'logout') repo.signOut();
+              },
+              itemBuilder: (_) => [
+                PopupMenuItem(enabled: false, child: Text(account)),
+                const PopupMenuItem(value: 'logout', child: Text('로그아웃')),
+              ],
+            ),
+        ],
+      ),
       body: ListenableBuilder(
         listenable: store,
         builder: (context, _) {
@@ -72,7 +96,7 @@ class HomeScreen extends StatelessWidget {
                   onPressed: () => Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (_) => SessionScreen(store: store, policy: policy),
+                      builder: (_) => SessionScreen(repo: repo),
                     ),
                   ),
                 ),

@@ -1,20 +1,17 @@
 import 'package:flutter/material.dart';
 
 import '../ads/reward_ad.dart';
-import '../data/study_store.dart';
+import '../data/study_repository.dart';
 import '../format.dart';
-import '../logic/rewards.dart';
 
 class ResultScreen extends StatefulWidget {
   const ResultScreen({
     super.key,
-    required this.store,
-    required this.policy,
+    required this.repo,
     required this.record,
   });
 
-  final StudyStore store;
-  final RewardPolicy policy;
+  final StudyRepository repo;
   final StudyRecord record;
 
   @override
@@ -28,7 +25,13 @@ class _ResultScreenState extends State<ResultScreen> {
     setState(() => _busy = true);
     final rewarded = await showRewardedAd(context);
     if (rewarded) {
-      await widget.store.addBonus(widget.record, widget.record.points);
+      try {
+        await widget.repo.claimBonus(widget.record);
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        }
+      }
     }
     if (mounted) setState(() => _busy = false);
   }
@@ -37,9 +40,10 @@ class _ResultScreenState extends State<ResultScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final r = widget.record;
-    final reachedCap =
-        widget.store.basePointsOn(r.startedAt) >= widget.policy.dailyCap;
-    final tooShort = r.focused.inMinutes < widget.policy.minimumMinutes;
+    final policy = widget.repo.policy;
+    final tooShort = r.focused.inMinutes < policy.minimumMinutes;
+    // 한도 때문에 덜 받았는지
+    final reachedCap = !tooShort && r.points < r.focused.inMinutes * policy.pointsPerMinute;
     final canBoost = r.points > 0 && r.bonusPoints == 0;
 
     return Scaffold(
@@ -69,10 +73,16 @@ class _ResultScreenState extends State<ResultScreen> {
               ),
               if (r.bonusPoints > 0) Text('광고 보너스 +${r.bonusPoints} P 포함'),
               if (tooShort)
-                Text('${widget.policy.minimumMinutes}분 이상 순공해야 포인트가 쌓여요.'),
-              if (!tooShort && reachedCap) const Text('오늘 적립 한도에 도달했어요.'),
+                Text('${policy.minimumMinutes}분 이상 순공해야 포인트가 쌓여요.'),
+              if (reachedCap) const Text('오늘 적립 한도에 도달했어요.'),
               const SizedBox(height: 8),
-              Text('보유 포인트 ${widget.store.balance} P', style: theme.textTheme.bodySmall),
+              ListenableBuilder(
+                listenable: widget.repo,
+                builder: (_, _) => Text(
+                  '보유 포인트 ${widget.repo.balance} P',
+                  style: theme.textTheme.bodySmall,
+                ),
+              ),
               const Spacer(),
               if (canBoost) ...[
                 SizedBox(

@@ -1,0 +1,160 @@
+rules_version = '2';
+
+// 순공 앱 Firestore 보안 규칙
+//
+// 포인트는 돈과 같으므로 앱이 마음대로 값을 쓰지 못하게, 모든 쓰기를 아래 세 가지
+// 동작으로만 허용하고 서버 시간(request.time)으로 검증합니다.
+//
+//   1) 순공 시작: 세션 문서 생성 + users.activeSessionId 설정 (한 번에)
+//   2) 순공 종료: 세션 완료 + 하루 적립 문서 갱신 + 포인트 적립 (한 트랜잭션)
+//   3) 광고 보너스: 세션 bonusPoints 기록 + 포인트 적립 (한 번에)
+//
+// 한계: 폰이 실제로 뒤집혀 있었는지는 서버가 알 수 없습니다. 서버는 "시작부터 종료까지
+// 실제로 흐른 시간"보다 많은 순공 시간을 거부하고, 하루 한도를 지키게 할 뿐입니다.
+//
+// 포인트 정책은 앱의 lib/logic/rewards.dart (RewardPolicy) 와 같아야 합니다.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function pointsPerMinute() { return 1; }
+    function dailyCap() { return 600; }
+    // 기기 시계와 서버 시계 차이 허용치 (초)
+    function clockToleranceSec() { return 10; }
+
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+    function sessionPath(uid, sid) {
+      return /databases/$(database)/documents/users/$(uid)/sessions/$(sid);
+    }
+    function dayPath(uid, dayId) {
+      return /databases/$(database)/documents/users/$(uid)/days/$(dayId);
+    }
+    // 한국 시간 기준 날짜 id. 예: 2026-11-15 -> "20261115"
+    function kstDayId(t) {
+      let k = t + duration.value(9, 'h');
+      return string(k.year() * 10000 + k.month() * 100 + k.day());
+    }
+    function basePointsBefore(uid, dayId) {
+      return exists(dayPath(uid, dayId)) ? get(dayPath(uid, dayId)).data.basePoints : 0;
+    }
+    function minInt(a, b) { return a < b ? a : b; }
+    function maxInt(a, b) { return a > b ? a : b; }
+
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['balance', 'activeSessionId', 'createdAt'])
+        && request.resource.data.balance == 0
+        && request.resource.data.activeSessionId == null
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if isOwner(uid)
+        && (userStartsSession(uid) || userFinishesSession(uid) || userClaimsBonus(uid));
+
+      // 1) 시작: 새로 만들어지는 세션을 활성 세션으로 지정 (이전 활성 세션은 버려짐)
+      function userStartsSession(uid) {
+        let sid = request.resource.data.activeSessionId;
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['activeSessionId'])
+          && sid is string
+          && !exists(sessionPath(uid, sid))
+          && getAfter(sessionPath(uid, sid)).data.status == 'active';
+      }
+
+      // 2) 종료: 활성 세션이 완료되면서 그 포인트만큼만 잔액 증가
+      function userFinishesSession(uid) {
+        let sid = resource.data.activeSessionId;
+        return sid is string
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'activeSessionId'])
+          && request.resource.data.activeSessionId == null
+          && get(sessionPath(uid, sid)).data.status == 'active'
+          && getAfter(sessionPath(uid, sid)).data.status == 'done'
+          && request.resource.data.balance == resource.data.balance + getAfter(sessionPath(uid, sid)).data.points;
+      }
+
+      // 3) 광고 보너스: 세션 포인트만큼 한 번만 증가
+      function userClaimsBonus(uid) {
+        let sid = request.resource.data.lastBonusSessionId;
+        return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['balance', 'lastBonusSessionId'])
+          && sid is string
+          && get(sessionPath(uid, sid)).data.status == 'done'
+          && get(sessionPath(uid, sid)).data.bonusPoints == 0
+          && getAfter(sessionPath(uid, sid)).data.bonusPoints == get(sessionPath(uid, sid)).data.points
+          && request.resource.data.balance == resource.data.balance + get(sessionPath(uid, sid)).data.points;
+      }
+    }
+
+    match /users/{uid}/sessions/{sid} {
+      allow read: if isOwner(uid);
+
+      // 1) 시작
+      allow create: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['status', 'startedAt'])
+        && request.resource.data.status == 'active'
+        && request.resource.data.startedAt == request.time
+        && getAfter(userPath(uid)).data.activeSessionId == sid;
+
+      allow update: if isOwner(uid) && (sessionFinishes(uid, sid) || sessionClaimsBonus(uid, sid));
+
+      // 2) 종료
+      function sessionFinishes(uid, sid) {
+        let before = resource.data;
+        let after = request.resource.data;
+        let elapsedSec = (request.time - before.startedAt).seconds();
+        let dayId = kstDayId(before.startedAt);
+        let prevBase = basePointsBefore(uid, dayId);
+        let earned = math.floor(after.focusedSec / 60) * pointsPerMinute();
+        return before.status == 'active'
+          && get(userPath(uid)).data.activeSessionId == sid
+          && after.keys().hasOnly(['status', 'startedAt', 'endedAt', 'focusedSec', 'interruptions', 'points', 'bonusPoints', 'dayId'])
+          && after.status == 'done'
+          && after.startedAt == before.startedAt
+          && after.endedAt == request.time
+          && after.focusedSec is int
+          && after.focusedSec >= 0
+          && after.focusedSec <= elapsedSec + clockToleranceSec()
+          && after.interruptions is int
+          && after.interruptions >= 0
+          && after.bonusPoints == 0
+          && after.dayId == dayId
+          && after.points == minInt(earned, maxInt(0, dailyCap() - prevBase))
+          && getAfter(dayPath(uid, dayId)).data.basePoints == prevBase + after.points
+          && getAfter(userPath(uid)).data.balance == get(userPath(uid)).data.balance + after.points;
+      }
+
+      // 3) 광고 보너스
+      function sessionClaimsBonus(uid, sid) {
+        return resource.data.status == 'done'
+          && resource.data.bonusPoints == 0
+          && resource.data.points > 0
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['bonusPoints'])
+          && request.resource.data.bonusPoints == resource.data.points
+          && getAfter(userPath(uid)).data.balance == get(userPath(uid)).data.balance + resource.data.points;
+      }
+    }
+
+    // 하루(한국 시간) 기본 적립 포인트. 하루 한도 계산용.
+    match /users/{uid}/days/{dayId} {
+      allow read: if isOwner(uid);
+
+      allow create, update: if isOwner(uid)
+        && request.resource.data.keys().hasOnly(['basePoints', 'lastSessionId'])
+        && request.resource.data.lastSessionId is string
+        && dayUpdatedByFinish(uid, dayId, request.resource.data.lastSessionId);
+
+      function dayUpdatedByFinish(uid, dayId, sid) {
+        let prev = resource == null ? 0 : resource.data.basePoints;
+        let sessionAfter = getAfter(sessionPath(uid, sid)).data;
+        return get(sessionPath(uid, sid)).data.status == 'active'
+          && sessionAfter.status == 'done'
+          && sessionAfter.dayId == dayId
+          && request.resource.data.basePoints == prev + sessionAfter.points;
+      }
+    }
+  }
+}

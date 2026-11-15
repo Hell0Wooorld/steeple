@@ -6,10 +6,9 @@ import 'package:flutter/services.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-import '../data/study_store.dart';
+import '../data/study_repository.dart';
 import '../format.dart';
 import '../logic/flip_detector.dart';
-import '../logic/rewards.dart';
 import '../logic/study_session.dart';
 import 'result_screen.dart';
 
@@ -20,18 +19,23 @@ import 'result_screen.dart';
 /// 실제로 화면을 꺼 버리면 앱이 멈춰 다른 앱 사용 여부를 확인할 수 없기 때문입니다.
 /// 다른 앱으로 나가거나 전원 버튼으로 화면을 끄면 일시정지됩니다.
 class SessionScreen extends StatefulWidget {
-  const SessionScreen({super.key, required this.store, required this.policy});
+  const SessionScreen({super.key, required this.repo});
 
-  final StudyStore store;
-  final RewardPolicy policy;
+  final StudyRepository repo;
 
   @override
   State<SessionScreen> createState() => _SessionScreenState();
 }
 
 class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserver {
-  final _session = StudySession();
   final _detector = FlipDetector();
+
+  /// 서버에 시작이 기록된 뒤에 만들어짐. 그 전에는 뒤집어도 시간이 쌓이지 않음.
+  StudySession? _sessionOrNull;
+  SessionTicket? _ticket;
+  String? _beginError;
+
+  StudySession get _session => _sessionOrNull!;
   StreamSubscription<AccelerometerEvent>? _sensorSub;
   Timer? _ticker;
   bool _sensorAvailable = true;
@@ -41,10 +45,13 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable();
+    // 화면 꺼짐 방지. 지원하지 않는 환경(일부 브라우저 등)에서는 조용히 무시
+    WakelockPlus.enable().catchError((_) {});
+    _begin();
     _sensorSub = accelerometerEventStream(samplingPeriod: SensorInterval.normalInterval).listen(
       (e) {
-        if (_detector.update(e.x, e.y, e.z, DateTime.now())) {
+        if (_detector.update(e.x, e.y, e.z, DateTime.now()) || _justStarted) {
+          _justStarted = false;
           _applyFlip(_detector.isFaceDown);
         }
       },
@@ -56,18 +63,37 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
     });
   }
 
+  /// 시작 기록 직후, 이미 뒤집혀 있으면 바로 반영하기 위한 표시
+  bool _justStarted = false;
+
+  Future<void> _begin() async {
+    setState(() => _beginError = null);
+    try {
+      final ticket = await widget.repo.begin();
+      if (!mounted) return;
+      setState(() {
+        _ticket = ticket;
+        _sessionOrNull = StudySession();
+        _justStarted = _detector.isFaceDown;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _beginError = '$e');
+    }
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _sensorSub?.cancel();
     _ticker?.cancel();
-    WakelockPlus.disable();
+    WakelockPlus.disable().catchError((_) {});
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_sessionOrNull == null) return;
     if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
       _session.onAppLeft();
       _setImmersive(false);
@@ -76,6 +102,7 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
   }
 
   void _applyFlip(bool faceDown) {
+    if (_sessionOrNull == null) return;
     if (_session.phase == SessionPhase.finished) return;
     if (faceDown) {
       _session.onFaceDown();
@@ -95,31 +122,58 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
 
   Future<void> _end() async {
     if (_ending) return;
-    _ending = true;
+    final ticket = _ticket;
+    if (ticket == null) {
+      Navigator.pop(context);
+      return;
+    }
+    setState(() => _ending = true);
     _session.finish();
-    final policy = widget.policy;
-    final focused = _session.focused;
-    final points = policy.pointsFor(
-      focused,
-      alreadyEarnedToday: widget.store.basePointsOn(_session.startedAt),
-    );
-    final record = StudyRecord(
-      startedAt: _session.startedAt,
-      focused: focused,
-      points: points,
-      interruptions: _session.interruptions,
-    );
-    if (focused.inSeconds > 0) await widget.store.add(record);
-    if (!mounted) return;
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(
-        builder: (_) => ResultScreen(store: widget.store, policy: policy, record: record),
-      ),
-    );
+    try {
+      final record = await widget.repo.finish(
+        ticket,
+        focused: _session.focused,
+        interruptions: _session.interruptions,
+      );
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => ResultScreen(repo: widget.repo, record: record)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _ending = false);
+      final retry = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('저장하지 못했어요'),
+          content: Text('$e'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('저장하지 않고 나가기'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('다시 시도'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted) return;
+      if (retry == true) {
+        await _end();
+      } else {
+        Navigator.pop(context);
+      }
+    }
   }
 
   Future<void> _confirmEnd() async {
+    if (_sessionOrNull == null) {
+      Navigator.pop(context);
+      return;
+    }
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -141,7 +195,37 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) _confirmEnd();
       },
-      child: _session.isRunning ? _buildDark() : _buildIdle(context),
+      child: _sessionOrNull == null
+          ? _buildConnecting(context)
+          : _session.isRunning
+              ? _buildDark()
+              : _buildIdle(context),
+    );
+  }
+
+  Widget _buildConnecting(BuildContext context) {
+    final error = _beginError;
+    return Scaffold(
+      appBar: AppBar(title: const Text('순공 중')),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (error == null) ...[
+                const CircularProgressIndicator(),
+                const SizedBox(height: 16),
+                const Text('순공 시작을 기록하는 중…'),
+              ] else ...[
+                Text(error, textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                FilledButton(onPressed: _begin, child: const Text('다시 시도')),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -216,8 +300,13 @@ class _SessionScreenState extends State<SessionScreen> with WidgetsBindingObserv
                 width: double.infinity,
                 height: 56,
                 child: FilledButton.tonal(
-                  onPressed: _confirmEnd,
-                  child: const Text('순공 끝내기', style: TextStyle(fontSize: 18)),
+                  onPressed: _ending ? null : _confirmEnd,
+                  child: _ending
+                      ? const SizedBox.square(
+                          dimension: 22,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('순공 끝내기', style: TextStyle(fontSize: 18)),
                 ),
               ),
             ],
